@@ -14,7 +14,7 @@ PhantomSplit splits stereo audio into a mono center track and a wide (side) trac
 
 ## Install
 
-Download `PhantomSplit-1.0.0-Setup.exe` from the Releases page and run it.
+Download [PhantomSplit-1.0.0-Setup.exe](https://github.com/gilliaangilliaan/PhantomSplit/releases/download/1.0.0/PhantomSplit-1.0.0-Setup.exe) from the [1.0.0 release](https://github.com/gilliaangilliaan/PhantomSplit/releases/tag/1.0.0) and run it.
 
 The installer:
 
