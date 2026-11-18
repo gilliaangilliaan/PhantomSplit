@@ -1,0 +1,58 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <title>PhantomSplit</title>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1a1a20"/>
+      <stop offset="1" stop-color="#0a0a0d"/>
+    </linearGradient>
+    <linearGradient id="center" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ff5aa8"/>
+      <stop offset="1" stop-color="#e3176f"/>
+    </linearGradient>
+    <linearGradient id="wideL" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.16"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0.03"/>
+    </linearGradient>
+    <linearGradient id="wideR" x1="1" y1="0" x2="0" y2="0">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.16"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0.03"/>
+    </linearGradient>
+    <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="18"/>
+    </filter>
+  </defs>
+
+  <!-- tile -->
+  <rect width="512" height="512" rx="112" fill="url(#bg)"/>
+
+  <!-- neural links: outer wide nodes to the center tips -->
+  <g stroke="#ffffff" stroke-opacity="0.22" stroke-width="3" fill="none">
+    <path d="M76 256 L256 136 L436 256 L256 376 Z"/>
+  </g>
+
+  <!-- L and R channels (wide content) -->
+  <circle cx="206" cy="256" r="130" fill="url(#wideL)" stroke="#ffffff" stroke-opacity="0.38" stroke-width="4"/>
+  <circle cx="306" cy="256" r="130" fill="url(#wideR)" stroke="#ffffff" stroke-opacity="0.38" stroke-width="4"/>
+
+  <!-- phantom center glow -->
+  <path d="M256 136 A130 130 0 0 1 256 376 A130 130 0 0 1 256 136 Z" fill="#ff2d8a" opacity="0.55" filter="url(#glow)"/>
+
+  <!-- phantom center (L ∩ R), split from the wide parts by a dark gap -->
+  <path d="M256 136 A130 130 0 0 1 256 376 A130 130 0 0 1 256 136 Z"
+        fill="url(#center)" stroke="#0d0d10" stroke-width="10" stroke-linejoin="round"/>
+
+  <!-- isolated center signal -->
+  <g fill="#0d0d10" fill-opacity="0.85">
+    <rect x="222" y="236" width="9" height="40"  rx="4.5"/>
+    <rect x="237" y="216" width="9" height="80"  rx="4.5"/>
+    <rect x="251.5" y="196" width="9" height="120" rx="4.5"/>
+    <rect x="266" y="216" width="9" height="80"  rx="4.5"/>
+    <rect x="281" y="236" width="9" height="40"  rx="4.5"/>
+  </g>
+
+  <!-- network nodes -->
+  <circle cx="76"  cy="256" r="11" fill="#d8d8de"/>
+  <circle cx="436" cy="256" r="11" fill="#d8d8de"/>
+  <circle cx="256" cy="136" r="10" fill="#ffffff"/>
+  <circle cx="256" cy="376" r="10" fill="#ffffff"/>
+</svg>
