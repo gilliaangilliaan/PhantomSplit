@@ -30,6 +30,7 @@ Name: "desktopicon"; Description: "Create a desktop shortcut"
 Source: "..\phantomsplitnmdx.py"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\bs_roformer.py"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\phantomsplit.ico"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\phantomsplit.png"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\modules\bs_roformer\*.py"; DestDir: "{app}\modules\bs_roformer"; Flags: ignoreversion
 Source: "requirements.txt"; DestDir: "{app}\installer"; Flags: ignoreversion
 Source: "setup_env.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
@@ -51,6 +52,7 @@ Type: filesandordirs; Name: "{app}\modules"
 Type: filesandordirs; Name: "{app}\__pycache__"
 Type: files; Name: "{app}\phantomsplit_config.json"
 Type: files; Name: "{app}\phantomsplit.ico"
+Type: files; Name: "{app}\phantomsplit.png"
 
 [Code]
 var

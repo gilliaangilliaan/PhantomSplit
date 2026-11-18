@@ -4,13 +4,14 @@ PhantomSplit splits stereo audio into a mono center track and a wide (side) trac
 
 ## Features
 
-- **Mixture mode:** split a single file or a whole folder of songs into `center.flac` and `wide.flac`.
+- **Mixture mode:** split a single file or a whole folder of songs into a center and a wide file.
 - **Stems mode:** split every stem in a folder of one song, then mix the results down into one center and one wide file.
-- **Datasetting mode:** write single-channel `left.flac` / `right.flac` files with the mono center mixed in at a level you choose, for building training sets.
-- **Flat mode:** write `songname_center.flac` / `songname_wide.flac` into one folder, with no per-song subfolders.
+- **Flat mode:** write `songname_center` / `songname_wide` into one folder, with no per-song subfolders.
 - **TTA:** also split the song played backwards and average the two results (about twice the processing time).
+- **Output format:** WAV (16 / 24 / 32-bit float), FLAC (16 / 24-bit) or MP3 (128 to 320 kbps).
 - **Batch size and overlap:** adjustable in the app; the defaults come from the model's config.
-- Progress bar with percentage and time remaining, and resume support (finished songs are skipped).
+- Drag and drop a file or folder onto the window to set the input, or onto the output bar to set the output folder.
+- Progress bar for the whole batch with the song position ("song 3 of 40"), percentage and time remaining, a stop button, and resume support (finished songs are skipped).
 
 ## Install
 

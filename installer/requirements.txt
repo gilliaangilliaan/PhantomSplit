@@ -7,3 +7,4 @@ einops==0.8.2
 rotary-embedding-torch==0.3.5
 beartype==0.14.1
 packaging
+tkinterdnd2==0.7.0

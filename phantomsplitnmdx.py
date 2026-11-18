@@ -1,3 +1,4 @@
+import ctypes
 import json
 import os
 import queue
@@ -5,521 +6,356 @@ import re
 import shutil
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import traceback
 import urllib.request
 import webbrowser
 from concurrent.futures import ThreadPoolExecutor
+from itertools import chain, count
 from math import gcd
 from pathlib import Path
+
 import numpy as np
 import soundfile as sf
+import tkinter as tk
 import torch
 import yaml
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
-from tqdm.auto import tqdm
-
 from scipy.signal import resample_poly
+from tkinter import filedialog, messagebox, ttk
+from tqdm.auto import tqdm
 
 from bs_roformer import BSRoformer
 
 try:
-    import pyflac
-    HAVE_PYFLAC = True
+    from tkinterdnd2 import DND_FILES, TkinterDnD
 except ImportError:
-    HAVE_PYFLAC = False
+    TkinterDnD = None
 
-SAMPLE_RATE = 44100
-AUDIO_EXTS = (".wav", ".flac", ".m4a", ".mp3", ".aiff", ".aif")
-
-MODELS_DIR = Path(__file__).resolve().parent / "models"
 APP_VERSION = "1.0.0"
-MODEL_NAME = "BSRoformer"
+APP_ID = "gilliaan.phantomsplit"
+APP_DIR = Path(__file__).resolve().parent
+CONFIG_PATH = APP_DIR / "phantomsplit_config.json"
+ICON_PATH = APP_DIR / "phantomsplit.ico"
+LOGO_PATH = APP_DIR / "phantomsplit.png"
+LINKS = (
+    ("GitHub", "https://github.com/gilliaangilliaan"),
+    ("Ko-fi", "https://ko-fi.com/gilliaan"),
+    ("Hugging Face", "https://huggingface.co/gilliaan"),
+)
+
+MODELS_DIR = APP_DIR / "models"
+MODEL_NAME = "BS-Roformer"
 MODEL_URL = "https://huggingface.co/gilliaan/CenterWide-Models/resolve/main/BandSplitSpatialFormer"
 MODEL_CONFIG = MODELS_DIR / "gilliaan_bsspatialroformer_centerwide_v4.yaml"
 MODEL_CKPT = MODELS_DIR / "gilliaan_bsspatialroformer_centerwide_v4.ckpt"
-PARALLEL_SPLITS = 2
-GPU_LOCK = threading.Lock()
 
-CONFIG_PATH = Path(__file__).resolve().parent / "phantomsplit_config.json"
-ICON_PATH = Path(__file__).resolve().parent / "phantomsplit.ico"
-APP_ID = "gilliaan.phantomsplit"
-LINKS = (
-    ("github", "https://github.com/gilliaangilliaan"),
-    ("ko-fi", "https://ko-fi.com/gilliaan"),
-    ("hugging face", "https://huggingface.co/gilliaan"),
-)
+SAMPLE_RATE = 44100
+AUDIO_EXTS = (".wav", ".flac", ".m4a", ".mp3", ".aiff", ".aif")
+MODES = ("mixture", "stems")
+QUALITY = {"wav": ("16", "24", "32"), "flac": ("16", "24"), "mp3": ("128", "192", "256", "320")}
+SUBTYPES = {"16": "PCM_16", "24": "PCM_24", "32": "FLOAT"}
 DEFAULT_CONFIG = {
     "root": "", "out": "",
     "recursive": False, "input_type": "mixture", "flat": False,
     "tta": False, "batch_size": None, "num_overlap": None,
+    "format": "flac", "bits": "16", "kbps": "320",
 }
+
+WORKERS = 2
+GPU_LOCK = threading.Lock()
+STOP = threading.Event()
+
+
+class Stopped(Exception):
+    pass
+
+
+def check_stop():
+    if STOP.is_set():
+        raise Stopped
+
+
+class BatchProgress:
+    def __init__(self, total, emit, unit):
+        self.total, self.emit, self.unit = total, emit, unit
+        self.fractions, self.lock = {}, threading.Lock()
+
+    def report(self, key, fraction):
+        with self.lock:
+            self.fractions[key] = fraction
+            done = sum(self.fractions.values())
+            position = min(sum(f >= 1 for f in self.fractions.values()) + 1, self.total)
+            self.emit((round(done * 1000), self.total * 1000, f"{self.unit} {position} of {self.total}"))
+
+
+def load_yaml(path):
+    with open(path, encoding="utf-8") as f:
+        return yaml.load(f, Loader=yaml.FullLoader)
+
+
+def inference_defaults():
+    try:
+        inference = load_yaml(MODEL_CONFIG)["inference"]
+        return inference["batch_size"], inference["num_overlap"]
+    except Exception:
+        return 2, 2
+
+
+def load_config():
+    cfg = dict(DEFAULT_CONFIG)
+    try:
+        saved = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        cfg.update({k: v for k, v in saved.items() if k in cfg})
+    except Exception:
+        pass
+    for key, valid in (("input_type", MODES), ("format", QUALITY)):
+        if cfg[key] not in valid:
+            cfg[key] = DEFAULT_CONFIG[key]
+    for key, default in zip(("batch_size", "num_overlap"), inference_defaults()):
+        cfg[key] = cfg[key] or default
+    return cfg
+
+
+def download_model_files(emit, on_progress):
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    for path in (MODEL_CONFIG, MODEL_CKPT):
+        if path.exists():
+            continue
+        emit(f"Downloading {path.name}")
+        part = path.with_name(path.name + ".part")
+        with urllib.request.urlopen(f"{MODEL_URL}/{path.name}") as response, open(part, "wb") as f:
+            total, done = int(response.headers.get("Content-Length") or 0), 0
+            while chunk := response.read(1 << 20):
+                check_stop()
+                f.write(chunk)
+                done += len(chunk)
+                if total:
+                    on_progress(done, total)
+        part.replace(path)
+
+
+def load_engine(batch_size, num_overlap, tta):
+    config = load_yaml(MODEL_CONFIG)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = BSRoformer(**{**config["model"], "use_torch_checkpoint": False})
+    model.load_state_dict(torch.load(str(MODEL_CKPT), map_location="cpu", weights_only=True))
+    return {
+        "name": MODEL_NAME + (" (TTA)" if tta else ""), "model": model.to(device).eval(), "device": device,
+        "chunk_size": config["audio"]["chunk_size"], "instruments": config["training"]["instruments"],
+        "batch_size": batch_size, "num_overlap": num_overlap, "tta": tta,
+    }
+
+
+def load_audio(path):
+    audio, sr = sf.read(str(path), always_2d=True, dtype="float32")
+    if sr == SAMPLE_RATE:
+        return audio.T
+    g = gcd(sr, SAMPLE_RATE)
+    return np.stack([resample_poly(ch, SAMPLE_RATE // g, sr // g) for ch in audio.T]).astype("float32")
+
+
+def write_audio(path, audio, quality):
+    fmt = path.suffix[1:]
+    if quality != "32":
+        audio = np.clip(audio, -1.0, 1.0)
+    if fmt == "mp3":
+        options = {
+            "format": "MP3", "subtype": "MPEG_LAYER_III", "bitrate_mode": "CONSTANT",
+            "compression_level": (320 - int(quality)) / 288,
+        }
+    else:
+        options = {"subtype": SUBTYPES[quality]}
+        if fmt == "flac":
+            options["compression_level"] = 1.0
+    sf.write(str(path), audio.T, SAMPLE_RATE, **options)
+
+
+def demix(engine, mix, report):
+    c, batch_size = engine["chunk_size"], engine["batch_size"]
+    step = c // engine["num_overlap"]
+    border = c - step
+    padded = mix.shape[-1] > 2 * border > 0
+    if padded:
+        mix = np.pad(mix, ((0, 0), (border, border)), mode="reflect")
+
+    fade = max(c // 10, 1)
+    window = np.ones(c, dtype=np.float32)
+    window[:fade] = np.linspace(0, 1, fade, dtype=np.float32)
+    window[-fade:] = np.linspace(1, 0, fade, dtype=np.float32)
+
+    total = mix.shape[-1]
+    result = np.zeros((len(engine["instruments"]), 2, total), dtype=np.float32)
+    counter = np.zeros((1, total), dtype=np.float32)
+    positions = range(0, max(total - c, 0) + step, step)
+
+    bar = tqdm(total=len(positions), desc=engine["name"], unit="chunk", leave=False, disable=sys.stderr is None)
+    with GPU_LOCK, torch.no_grad(), bar:
+        for start in range(0, len(positions), batch_size):
+            check_stop()
+            batch = positions[start:start + batch_size]
+            chunks = [mix[:, pos:pos + c] for pos in batch]
+            stacked = np.stack([np.pad(chunk, ((0, 0), (0, c - chunk.shape[-1]))) for chunk in chunks])
+            out = engine["model"](torch.tensor(stacked, dtype=torch.float32, device=engine["device"])).cpu().numpy()
+            for pos, chunk, separated in zip(batch, chunks, out):
+                n = chunk.shape[-1]
+                result[..., pos:pos + n] += separated[..., :n] * window[:n]
+                counter[..., pos:pos + n] += window[:n]
+            bar.update(len(batch))
+            report((start + len(batch)) / len(positions))
+
+    result /= np.maximum(counter, 1e-8)
+    if padded:
+        result = result[..., border:-border]
+    stems = dict(zip(engine["instruments"], result))
+    return stems["center"], stems["wide"]
+
+
+def mono_fold(audio):
+    return np.repeat(audio.mean(axis=0, keepdims=True), len(audio), axis=0)
+
+
+def split(audio, engine, report):
+    if len(audio) == 1:
+        center = np.repeat(audio, 2, axis=0)
+        return center, np.zeros_like(center)
+
+    if engine["tta"]:
+        center, wide = demix(engine, audio, lambda fraction: report(fraction / 2))
+        center2, wide2 = demix(engine, audio[:, ::-1].copy(), lambda fraction: report((1 + fraction) / 2))
+        center, wide = (center + center2[:, ::-1]) / 2, (wide + wide2[:, ::-1]) / 2
+    else:
+        center, wide = demix(engine, audio, report)
+    return mono_fold(center), audio - mono_fold(audio - wide)
+
+
+def sum_mix(tracks):
+    out = np.zeros((tracks[0].shape[0], max(t.shape[1] for t in tracks)), dtype=np.float32)
+    for track in tracks:
+        out[:, :track.shape[1]] += track
+    return out
 
 
 def sanitize_name(name):
     return re.sub(r"[^0-9a-z\-_]", "", name.lower())
 
 
-def resample(audio, sr, target_sr):
-    if sr == target_sr:
-        return audio
-    g = gcd(sr, target_sr)
-    up, down = target_sr // g, sr // g
-    return np.stack([resample_poly(ch, up, down) for ch in audio], axis=0).astype("float32")
-
-
-class Cfg(dict):
-    def __getattr__(self, key):
-        try:
-            value = self[key]
-        except KeyError as e:
-            raise AttributeError(key) from e
-        return Cfg(value) if isinstance(value, dict) else value
-
-    __setattr__ = dict.__setitem__
-    __delattr__ = dict.__delitem__
-
-
-class YamlLoader(yaml.FullLoader):
-    pass
-
-
-YamlLoader.add_implicit_resolver(
-    "tag:yaml.org,2002:float",
-    re.compile(
-        r"""^(?:[-+]?(?:[0-9][0-9_]*)\.[0-9_]*(?:[eE][-+]?[0-9]+)?
-        |[-+]?(?:[0-9][0-9_]*)(?:[eE][-+]?[0-9]+)
-        |\.[0-9_]+(?:[eE][-+][0-9]+)?
-        |[-+]?[0-9][0-9_]*(?::[0-5]?[0-9])+\.[0-9_]*
-        |[-+]?\.(?:inf|Inf|INF)
-        |\.(?:nan|NaN|NAN))$""",
-        re.X,
-    ),
-    list("-+0123456789."),
-)
-
-
-def load_yaml_config(path):
-    with open(path, "r", encoding="utf-8") as f:
-        return Cfg(yaml.load(f, Loader=YamlLoader))
-
-
-def prefer_target_instrument(config):
-    if config.training.target_instrument:
-        return [config.training.target_instrument]
-    return list(config.training.instruments)
-
-
-def load_audio(path, target_sr):
-    audio, sr = sf.read(str(path), always_2d=True, dtype="float32")
-    audio = resample(audio.T, sr, target_sr)
-    return audio, audio.shape[0] == 1
-
-
-def write_flac(path, audio, sr):
-    audio = resample(audio, sr, SAMPLE_RATE)
-    pcm16 = (np.clip(audio, -1.0, 1.0) * 32767.0).astype(np.int16)
-    if HAVE_PYFLAC:
-        tmp_fd, tmp_name = tempfile.mkstemp(suffix=".wav", dir=str(path.parent))
-        os.close(tmp_fd)
-        tmp = Path(tmp_name)
-        sf.write(str(tmp), pcm16.T, SAMPLE_RATE, subtype="PCM_16")
-        try:
-            pyflac.FileEncoder(input_file=tmp, output_file=path, compression_level=8).process()
-            return
-        except Exception as e:
-            print(f"    [warn] pyflac failed ({e}), using soundfile instead")
-        finally:
-            tmp.unlink(missing_ok=True)
-    sf.write(str(path), pcm16.T, SAMPLE_RATE, subtype="PCM_16")
-
-
-def find_state_dict(obj, _seen=None):
-    if _seen is None:
-        _seen = set()
-    if id(obj) in _seen or not isinstance(obj, dict) or not obj:
-        return None
-    _seen.add(id(obj))
-    if all(torch.is_tensor(v) for v in obj.values()):
-        return obj
-    for v in obj.values():
-        found = find_state_dict(v, _seen)
-        if found is not None:
-            return found
-    return None
-
-
-def extract_state_dict(ckpt):
-    found = find_state_dict(ckpt)
-    if found is not None:
-        return found
-    if isinstance(ckpt, dict):
-        tensor_only = {k: v for k, v in ckpt.items() if torch.is_tensor(v)}
-        if tensor_only:
-            return tensor_only
-        kinds = {k: type(v).__name__ for k, v in ckpt.items()}
-        raise RuntimeError(f"could not find a tensor state dict inside checkpoint; top-level keys: {kinds}")
-    return ckpt
-
-
-def download_model_files(emit, on_progress=None):
-    MODELS_DIR.mkdir(parents=True, exist_ok=True)
-    for path in (MODEL_CONFIG, MODEL_CKPT):
-        if path.exists():
-            continue
-        emit(f"downloading {path.name}")
-        part = path.with_name(path.name + ".part")
-        with urllib.request.urlopen(f"{MODEL_URL}/{path.name}") as response, open(part, "wb") as f:
-            total, done = int(response.headers.get("Content-Length") or 0), 0
-            while chunk := response.read(1 << 20):
-                f.write(chunk)
-                done += len(chunk)
-                if on_progress and total:
-                    on_progress(done, total)
-        part.replace(path)
-
-
-def load_engine(batch_size, num_overlap, tta=False):
-    for path in (MODEL_CONFIG, MODEL_CKPT):
-        if not path.exists():
-            raise FileNotFoundError(f"{path.name} is missing from {MODELS_DIR}")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    config = load_yaml_config(MODEL_CONFIG)
-    model = BSRoformer(**{**config.model, "use_torch_checkpoint": False})
-    model.load_state_dict(extract_state_dict(torch.load(str(MODEL_CKPT), map_location="cpu", weights_only=True)))
-    model.to(device).eval()
-    return {
-        "name": MODEL_NAME + (" (tta)" if tta else ""), "model": model, "config": config, "device": device,
-        "batch_size": batch_size, "num_overlap": num_overlap, "tta": tta,
-    }
-
-
-def load_engines(batch_size, num_overlap, tta=False, count=PARALLEL_SPLITS):
-    return [load_engine(batch_size, num_overlap, tta)] * count
-
-
-def model_inference_defaults():
-    try:
-        inference = load_yaml_config(MODEL_CONFIG).inference
-        return inference.batch_size, inference.num_overlap
-    except Exception:
-        return 2, 2
-
-
-class EnginePool:
-    def __init__(self, engines):
-        self.size = len(engines)
-        self.engine = engines[0]
-        self.free = queue.Queue()
-        for e in engines:
-            self.free.put(e)
-
-    def run(self, fn, *args, **kwargs):
-        engine = self.free.get()
-        try:
-            return fn(*args, engine=engine, **kwargs)
-        finally:
-            self.free.put(engine)
-
-
-def demix_chunked(model, config, mix, device, batch_size, num_overlap, desc=None, on_progress=None):
-    c = config.audio.chunk_size
-    step = c // num_overlap
-    fade_size = max(c // 10, 1)
-    border = c - step
-
-    length_init = mix.shape[-1]
-    if length_init > 2 * border and border > 0:
-        mix = np.pad(mix, ((0, 0), (border, border)), mode="reflect")
-
-    window = np.ones(c, dtype=np.float32)
-    window[:fade_size] = np.linspace(0, 1, fade_size, dtype=np.float32)
-    window[-fade_size:] = np.linspace(1, 0, fade_size, dtype=np.float32)
-
-    instruments = prefer_target_instrument(config)
-    total_length = mix.shape[-1]
-    result = np.zeros((len(instruments), 2, total_length), dtype=np.float32)
-    counter = np.zeros((1, total_length), dtype=np.float32)
-
-    positions = []
-    i = 0
-    while i < total_length:
-        positions.append(i)
-        if i + c >= total_length:
-            break
-        i += step
-
-    progress = tqdm(total=len(positions), desc=desc or "Processing audio chunks", unit="chunk", leave=False, disable=sys.stderr is None)
-    with torch.no_grad(), progress:
-        for b_start in range(0, len(positions), batch_size):
-            batch_positions = positions[b_start:b_start + batch_size]
-            batch_chunks = []
-            lens = []
-            for pos in batch_positions:
-                chunk = mix[:, pos:pos + c]
-                lens.append(chunk.shape[-1])
-                if chunk.shape[-1] < c:
-                    chunk = np.pad(chunk, ((0, 0), (0, c - chunk.shape[-1])))
-                batch_chunks.append(chunk)
-            batch_tensor = torch.tensor(np.stack(batch_chunks), dtype=torch.float32, device=device)
-            out = model(batch_tensor).cpu().numpy()
-            for j, pos in enumerate(batch_positions):
-                seg_len = lens[j]
-                w = window[:seg_len]
-                result[:, :, pos:pos + seg_len] += out[j, :, :, :seg_len] * w
-                counter[:, pos:pos + seg_len] += w
-            progress.update(len(batch_positions))
-            if on_progress:
-                on_progress(min(b_start + batch_size, len(positions)), len(positions))
-
-    result /= np.maximum(counter, 1e-8)[None, ...]
-
-    if length_init > 2 * border and border > 0:
-        result = result[:, :, border:-border]
-
-    return {inst: result[idx] for idx, inst in enumerate(instruments)}
-
-
-def run_engine(engine, audio, part=0, parts=1):
-    on_progress = engine.get("on_progress")
-    scaled = (lambda done, total: on_progress(part * total + done, parts * total)) if on_progress else None
-    with GPU_LOCK:
-        out = demix_chunked(
-            engine["model"], engine["config"], audio, engine["device"],
-            engine["batch_size"], engine["num_overlap"], desc=engine["name"],
-            on_progress=scaled,
-        )
-    return out["center"], out["wide"]
-
-
-def extract_center_wide(audio, is_mono, engine):
-    if is_mono:
-        center = np.vstack([audio[0], audio[0]])
-        return center, np.zeros_like(center)
-
-    parts = 2 if engine.get("tta") else 1
-    center, wide = run_engine(engine, audio, 0, parts)
-    if parts == 2:
-        center2, wide2 = run_engine(engine, audio[:, ::-1].copy(), 1, parts)
-        center, wide = (center + center2[:, ::-1]) / 2, (wide + wide2[:, ::-1]) / 2
-
-    inverted_center = audio - wide
-    wide = audio - mono_fold(inverted_center)
-
-    return mono_fold(center), wide
-
-
-def mono_fold(audio):
-    mono = audio.mean(axis=0, keepdims=True)
-    return np.repeat(mono, audio.shape[0], axis=0)
-
-
-def sum_mix(chunks):
-    n = max(c.shape[1] for c in chunks)
-    out = np.zeros((chunks[0].shape[0], n), dtype=np.float32)
-    for c in chunks:
-        out[:, :c.shape[1]] += c
-    return out
-
-
-def output_names(file_prefix=""):
-    return tuple(f"{file_prefix}{name}.flac" for name in ("center", "wide"))
-
-
-def write_output(out_dir, center, wide, engine, emit, prefix="", file_prefix=""):
-    out_dir.mkdir(parents=True, exist_ok=True)
-    names = output_names(file_prefix)
-    for name, audio in zip(names, (center, wide)):
-        write_flac(out_dir / name, audio, SAMPLE_RATE)
-    emit(f"  wrote {' / '.join(names)} ({prefix}{engine['name']}) -> {out_dir}")
-
-
-def process_file(src_path, engine, out_dir, emit, file_prefix=""):
-    audio, is_mono = load_audio(src_path, SAMPLE_RATE)
-    if is_mono:
-        emit("    (mono, passthrough to center)")
-    center, wide = extract_center_wide(audio, is_mono, engine)
-    write_output(out_dir, center, wide, engine, emit, file_prefix=file_prefix)
-
-
-def split_stem(stem_path, emit, engine):
-    emit(f"    stem: {stem_path.name}")
-    audio, is_mono = load_audio(stem_path, SAMPLE_RATE)
-    return extract_center_wide(audio, is_mono, engine)
-
-
-def process_stems_folder(folder, pool, out_dir, emit, file_prefix=""):
-    stem_files = sorted(p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in AUDIO_EXTS)
-    if not stem_files:
-        emit(f"  [warn] no stem files found in {folder}")
-        return
-
-    with ThreadPoolExecutor(max_workers=pool.size) as executor:
-        results = list(executor.map(lambda p: pool.run(split_stem, p, emit), stem_files))
-    centers = [center for center, _ in results]
-    wides = [wide for _, wide in results]
-
-    write_output(
-        out_dir, sum_mix(centers), sum_mix(wides), pool.engine, emit,
-        prefix=f"mixed from {len(stem_files)} stems, ", file_prefix=file_prefix,
-    )
-
-
-def is_complete(out_dir, file_prefix=""):
-    return all((out_dir / name).exists() for name in output_names(file_prefix))
+def find_audio(folder, recursive=False):
+    files = folder.rglob("*") if recursive else folder.iterdir()
+    return sorted(p for p in files if p.is_file() and p.suffix.lower() in AUDIO_EXTS)
 
 
 def unique_flat_name(clean_name, taken):
-    name, n = clean_name, 2
-    while name in taken:
-        name = f"{clean_name}{n}"
-        n += 1
+    numbered = (f"{clean_name}{i}" for i in count(2))
+    name = next(n for n in chain([clean_name], numbered) if n not in taken)
     taken.add(name)
     return name
 
 
 def resolve_out_dir(out_root, clean_name, source_name):
     out_dir = out_root / clean_name
-    if not out_dir.exists():
-        return out_dir
     marker = out_dir / ".source_name"
-    existing = marker.read_text(encoding="utf-8").strip() if marker.exists() else None
-    if existing is None or existing == source_name:
+    if not marker.exists() or marker.read_text(encoding="utf-8").strip() == source_name:
         return out_dir
-    n = 2
-    while (out_root / f"{clean_name}{n}").exists():
-        n += 1
-    return out_root / f"{clean_name}{n}"
+    return next(d for i in count(2) if not (d := out_root / f"{clean_name}{i}").exists())
 
 
-def load_config():
-    cfg = dict(DEFAULT_CONFIG)
-    if CONFIG_PATH.exists():
+def plan_tasks(sources, out, flat, fmt, emit):
+    tasks, taken = [], set()
+    for i, source in enumerate(sources, 1):
+        name = sanitize_name(source.stem if source.is_file() else source.name) or f"track{i}"
+        if flat:
+            name = unique_flat_name(name, taken)
+            folder, prefix, label = out, f"{name}_", f"{name}_*"
+        else:
+            folder = resolve_out_dir(out, name, source.name)
+            prefix, label = "", folder.name
+        paths = [folder / f"{prefix}{track}.{fmt}" for track in ("center", "wide")]
+        header = f"[{i}/{len(sources)}] {source.name} -> {label}"
+        if all(path.exists() for path in paths):
+            emit(f"{header} already done, skipping")
+            continue
+        if not flat:
+            folder.mkdir(parents=True, exist_ok=True)
+            (folder / ".source_name").write_text(source.name, encoding="utf-8")
+        tasks.append((source, paths, header))
+    return tasks
+
+
+def run_batch(root, out, engine, emit, *, recursive, stems_mode, flat, fmt, quality):
+    root, out = Path(root), Path(out)
+    out.mkdir(parents=True, exist_ok=True)
+    note = engine["name"]
+    if stems_mode:
+        stems = find_audio(root)
+        sources = [root] if stems else []
+        note = f"mixed from {len(stems)} stems, {note}"
+        if not stems:
+            emit(f"  [warn] No stem files found in {root}")
+    else:
+        sources = [root] if root.is_file() else find_audio(root, recursive)
+        emit(f"Found {len(sources)} mixture file(s)")
+
+    tasks = plan_tasks(sources, out, flat, fmt, emit)
+    progress = BatchProgress(len(stems) if stems_mode else len(tasks), emit, "Stem" if stems_mode else "Song")
+
+    def split_file(path):
         try:
-            saved = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-        except Exception:
-            saved = {}
-        cfg.update({k: v for k, v in saved.items() if k in DEFAULT_CONFIG})
-    if cfg["input_type"] not in ("mixture", "stems"):
-        cfg["input_type"] = "mixture"
-    for key, default in zip(("batch_size", "num_overlap"), model_inference_defaults()):
-        cfg[key] = cfg[key] or default
-    return cfg
+            audio = load_audio(path)
+            if len(audio) == 1:
+                emit("    (Mono, passed through to center)")
+            return split(audio, engine, lambda fraction: progress.report(path, fraction))
+        finally:
+            progress.report(path, 1)
 
+    def split_stems():
+        def split_stem(path):
+            emit(f"    Stem: {path.name}")
+            return split_file(path)
 
-def save_config(values):
-    CONFIG_PATH.write_text(json.dumps(values, indent=2), encoding="utf-8")
+        with ThreadPoolExecutor(WORKERS) as executor:
+            return [sum_mix(tracks) for tracks in zip(*executor.map(split_stem, stems))]
 
+    def run_task(source, paths, header):
+        if STOP.is_set():
+            return
+        emit(header)
+        try:
+            tracks = split_stems() if stems_mode else split_file(source)
+            for path, audio in zip(paths, tracks):
+                write_audio(path, audio, quality)
+            emit(f"  Wrote {' / '.join(p.name for p in paths)} ({note}) -> {paths[0].parent}")
+        except Stopped:
+            pass
+        except Exception as e:
+            emit(f"  [error] Failed on {source.name}: {e}")
 
-def disk_free_gb(path):
-    try:
-        return shutil.disk_usage(path).free / (1024 ** 3)
-    except Exception:
-        return None
+    if len(tasks) > 1:
+        emit(f"Processing {len(tasks)} file(s), {WORKERS} at a time")
+    with ThreadPoolExecutor(WORKERS) as executor:
+        list(executor.map(lambda task: run_task(*task), tasks))
+    emit("Stopped" if STOP.is_set() else "Done")
 
 
 def gpu_info():
     if torch.cuda.is_available():
-        return f"gpu: {torch.cuda.get_device_name(0)}"
-    return "gpu: none detected (cpu only)"
+        return f"GPU: {torch.cuda.get_device_name(0)}"
+    return "GPU: none detected (CPU only)"
 
 
-def open_folder(path_str):
-    p = Path(path_str)
-    if not p.exists():
+def open_folder(path):
+    if not Path(path).exists():
         return
     if os.name == "nt":
-        subprocess.Popen(["explorer", str(p)])
+        subprocess.Popen(["explorer", str(Path(path))])
     else:
-        webbrowser.open(p.as_uri())
+        webbrowser.open(Path(path).as_uri())
 
 
-def run_batch(root_str, out_str, recursive, engines, emit, stems_mode=False, flat=False):
-    pool = EnginePool(engines)
-    root = Path(root_str) if root_str else None
-    if not root or not root.exists():
-        emit(f"[error] input path does not exist: {root_str}")
-        return
-    if not out_str:
-        emit("[error] output folder is required")
-        return
-    out = Path(out_str)
-
-    if stems_mode:
-        if not root.is_dir():
-            emit("[error] stems mode requires a folder of stem files as input")
-            return
-        clean_name = sanitize_name(root.name) or "track1"
-        if flat:
-            out_dir, file_prefix, label = out, f"{clean_name}_", f"{clean_name}_*"
-        else:
-            out_dir = resolve_out_dir(out, clean_name, root.name)
-            file_prefix, label = "", out_dir.name
-        if is_complete(out_dir, file_prefix):
-            emit(f"{label} already done, skipping")
-            return
-        emit(f"mixing down stems in {root.name} -> {label}")
-        try:
-            process_stems_folder(root, pool, out_dir, emit, file_prefix=file_prefix)
-        except Exception as e:
-            emit(f"[error] failed on {root.name}: {e}")
-            return
-        if not flat:
-            (out_dir / ".source_name").write_text(root.name, encoding="utf-8")
-        emit("done")
-        return
-
-    out.mkdir(parents=True, exist_ok=True)
-    if not flat:
-        complete = {d.name for d in out.iterdir() if d.is_dir() and is_complete(d)}
-        emit(f"output folder already has {len(complete)} complete tracks - these will be skipped")
-
-    if root.is_file():
-        src_files = [root]
-    else:
-        finder = root.rglob("*") if recursive else root.iterdir()
-        src_files = sorted(p for p in finder if p.is_file() and p.suffix.lower() in AUDIO_EXTS)
-    emit(f"found {len(src_files)} mixture file(s)")
-
-    tasks = []
-    taken = set()
-    for i, src_path in enumerate(src_files, 1):
-        clean_name = sanitize_name(src_path.stem) or f"track{i}"
-        if flat:
-            name = unique_flat_name(clean_name, taken)
-            out_dir, file_prefix, label = out, f"{name}_", f"{name}_*"
-            done = is_complete(out, file_prefix)
-        else:
-            out_dir = resolve_out_dir(out, clean_name, src_path.name)
-            file_prefix, label = "", out_dir.name
-            done = out_dir.name in complete
-        if done:
-            emit(f"[{i}/{len(src_files)}] {src_path.name} -> {label} already done, skipping")
-            continue
-        if not flat:
-            out_dir.mkdir(parents=True, exist_ok=True)
-            (out_dir / ".source_name").write_text(src_path.name, encoding="utf-8")
-        tasks.append((i, src_path, out_dir, file_prefix, label))
-
-    def run_task(i, src_path, out_dir, file_prefix, label):
-        emit(f"[{i}/{len(src_files)}] {src_path.name} -> {label}")
-        try:
-            pool.run(
-                process_file, src_path, out_dir=out_dir, emit=emit,
-                file_prefix=file_prefix,
-            )
-        except Exception as e:
-            emit(f"  [error] failed on {src_path.name}: {e}")
-
-    if len(tasks) > 1:
-        emit(f"processing {len(tasks)} file(s), {pool.size} at a time")
-    with ThreadPoolExecutor(max_workers=pool.size) as executor:
-        for future in [executor.submit(run_task, *task) for task in tasks]:
-            future.result()
-    emit("done")
+def format_left(seconds):
+    hours, rest = divmod(seconds, 3600)
+    minutes, secs = divmod(rest, 60)
+    return f"{hours}:{minutes:02d}:{secs:02d} left" if hours else f"{minutes}:{secs:02d} left"
 
 
 BG = "#0d0d0f"
@@ -545,11 +381,16 @@ def toggle_colors(active, inactive_fg=FG):
     return (ACCENT, ACCENT_FG, ACCENT_DIM) if active else (INPUT_BG, inactive_fg, INPUT_HOVER)
 
 
-def enable_windows_dark_titlebar(win):
+def highlight(buttons, selected):
+    for name, btn in buttons.items():
+        bg, fg, active = toggle_colors(name == selected, inactive_fg=FG_MUTED)
+        btn.configure(bg=bg, fg=fg, activebackground=active)
+
+
+def enable_dark_titlebar(win):
     if os.name != "nt":
         return
     try:
-        import ctypes
         win.update()
         hwnd = ctypes.windll.user32.GetParent(win.winfo_id())
         value = ctypes.c_int(1)
@@ -575,13 +416,14 @@ def label(parent, text, muted=False, size=9, bold=False, **kw):
     return tk.Label(parent, text=text, **kw)
 
 
-def button(parent, text, command, accent=False, small=False):
+def button(parent, text, command, accent=False, small=False, **kw):
     bg, fg, active = toggle_colors(accent)
+    kw.setdefault("padx", 14)
     return tk.Button(
         parent, text=text, command=command, bg=bg, fg=fg,
         activebackground=active, activeforeground=fg, relief="flat", bd=0,
-        font=(FONT, 9 if small else 10, "bold"), padx=14, pady=6 if small else 8,
-        cursor="hand2", highlightthickness=0,
+        font=(FONT, 9 if small else 10, "bold"), pady=6 if small else 8,
+        cursor="hand2", highlightthickness=0, **kw,
     )
 
 
@@ -594,26 +436,15 @@ def entry(parent, var, **kw):
     )
 
 
-def check(parent, text, var):
-    bg = parent.cget("bg")
-    return tk.Checkbutton(
-        parent, text=text, variable=var, bg=bg, fg=FG,
-        activebackground=bg, activeforeground=FG, selectcolor=INPUT_BG,
-        relief="flat", bd=0, highlightthickness=0, font=(FONT, 9), cursor="hand2",
-    )
-
-
-def field(parent, text, var, suffix=""):
+def field(parent, text, var):
     put(label(parent, text), side="left")
-    box = put(entry(parent, var, width=6), side="left", padx=(6, 4), ipady=2)
-    put(label(parent, suffix), side="left", padx=(0, 14))
-    return box
+    return put(entry(parent, var, width=6), side="left", padx=(6, 24), ipady=2)
 
 
-def card(parent, title, subtitle):
+def card(parent, title, subtitle, **pack):
     outer = put(
         tk.Frame(parent, bg=CARD_BG, highlightbackground=CARD_BORDER, highlightthickness=1),
-        fill="x", padx=18, pady=8,
+        **{"fill": "x", "padx": 18, "pady": 8, **pack},
     )
     header = put(frame(outer), fill="x", padx=16, pady=(12, 8))
     put(frame(header, bg=ACCENT, width=3), side="left", fill="y", padx=(0, 10))
@@ -623,22 +454,69 @@ def card(parent, title, subtitle):
     return put(frame(outer), fill="both", expand=True, padx=16, pady=(0, 14))
 
 
-def path_field(body, var, actions):
-    row = put(frame(body), fill="x")
-    put(entry(row, var), side="left", fill="x", expand=True, ipady=4)
-    return [put(button(row, text, cmd, small=True), side="left", padx=(8, 0)) for text, cmd in actions]
+def path_field(body, text, var, actions):
+    row = put(frame(body), fill="x", pady=(0, 8))
+    put(label(row, text, width=6, anchor="w"), side="left")
+    box = put(entry(row, var), side="left", fill="x", expand=True, ipady=4)
+    buttons = [
+        put(button(row, name, command, small=True, width=12, padx=4), side="left", padx=(8, 0))
+        for name, command in actions
+    ]
+    return box, buttons
 
 
-class BatchGUI(tk.Tk):
+class Toggle(tk.Frame):
+    def __init__(self, parent, text, var):
+        super().__init__(parent, bg=parent.cget("bg"), cursor="hand2")
+        self.var, self.enabled = var, True
+        self.switch = put(tk.Canvas(self, width=34, height=18, bg=self.cget("bg"), highlightthickness=0), side="left")
+        self.text = put(label(self, text), side="left", padx=(8, 0))
+        for widget in (self, self.switch, self.text):
+            widget.bind("<Button-1>", self.toggle)
+        var.trace_add("write", lambda *_: self.draw())
+        self.draw()
+
+    def toggle(self, event=None):
+        if self.enabled:
+            self.var.set(not self.var.get())
+
+    def configure(self, state=None, **kw):
+        if state is not None:
+            self.enabled = state != "disabled"
+            self.draw()
+        if kw:
+            super().configure(**kw)
+
+    def draw(self):
+        on = self.var.get()
+        track = CARD_BORDER if not self.enabled else ACCENT if on else INPUT_BORDER
+        knob = FG_MUTED if not self.enabled else ACCENT_FG if on else FG
+        x = 20 if on else 4
+        c = self.switch
+        c.delete("all")
+        c.create_oval(1, 1, 17, 17, fill=track, outline=track)
+        c.create_oval(17, 1, 33, 17, fill=track, outline=track)
+        c.create_rectangle(9, 1, 25, 17, fill=track, outline=track)
+        c.create_oval(x, 4, x + 10, 14, fill=knob, outline=knob)
+        self.text.configure(fg=FG if self.enabled else FG_MUTED)
+
+
+class BatchGUI(tk.Tk, *((TkinterDnD.DnDWrapper,) if TkinterDnD else ())):
     def __init__(self):
         super().__init__()
-        self.title(f"phantomsplit {APP_VERSION}")
+        self.title(f"PhantomSplit {APP_VERSION}")
         if ICON_PATH.exists():
             self.iconbitmap(default=str(ICON_PATH))
-        self.geometry("820x720")
-        self.minsize(680, 560)
+        self.geometry("820x800")
+        self.resizable(False, False)
         self.configure(bg=BG)
-        enable_windows_dark_titlebar(self)
+        enable_dark_titlebar(self)
+        style = ttk.Style(self)
+        style.theme_use("clam")
+        style.configure(
+            "Accent.Horizontal.TProgressbar", troughcolor=CARD_BG, background=ACCENT,
+            bordercolor=CARD_BG, lightcolor=ACCENT, darkcolor=ACCENT, thickness=6,
+        )
 
         cfg = load_config()
         self.vars = {
@@ -648,128 +526,146 @@ class BatchGUI(tk.Tk):
         self.log_queue = queue.Queue()
         self.worker = None
 
-        style = ttk.Style(self)
-        style.theme_use("clam")
-        style.configure(
-            "Accent.Horizontal.TProgressbar", troughcolor=CARD_BG, background=ACCENT,
-            bordercolor=CARD_BG, lightcolor=ACCENT, darkcolor=ACCENT, thickness=6,
-        )
-
-        self.build_widgets()
+        self.build_footer()
+        self.build_header()
+        self.build_mode_and_status()
+        self.build_inference()
+        self.build_paths()
         self.set_input_type(cfg["input_type"])
+        self.set_format(cfg["format"])
+        self.set_running(False)
         self.update_disk_label()
-        self.set_status(False)
-        self.vars["out"].trace_add("write", lambda *a: self.update_disk_label())
+        self.vars["out"].trace_add("write", self.update_disk_label)
+        self.enable_drop()
         self.after(100, self.poll_log_queue)
 
-    def build_widgets(self):
-        v = self.vars
+    def build_footer(self):
         footer = put(
             frame(self, highlightbackground=CARD_BORDER, highlightthickness=1),
             side="bottom", fill="x", padx=18, pady=14,
         )
-        put(button(footer, "save config", self.on_save, small=True), side="left", padx=14, pady=12)
+        put(button(footer, "Save config", self.on_save, small=True), side="left", padx=14, pady=12)
         for text, url in LINKS:
             link = put(label(footer, text, muted=True, cursor="hand2"), side="left", padx=(0, 14))
             link.bind("<Button-1>", lambda e, u=url: webbrowser.open(u))
             link.bind("<Enter>", lambda e: e.widget.configure(fg=ACCENT))
             link.bind("<Leave>", lambda e: e.widget.configure(fg=FG_MUTED))
-        self.run_btn = put(button(footer, spaced("process"), self.on_run, accent=True), side="right", padx=14, pady=12)
+        self.run_btn = put(button(footer, spaced("PROCESS"), self.on_run, accent=True), side="right", padx=14, pady=12)
+        self.stop_btn = put(button(footer, spaced("STOP"), self.on_stop), side="right", pady=12)
 
-        body = self.build_scroll_area()
-        topbar = put(frame(body), fill="x", padx=18, pady=(16, 4))
-        wordmark = put(frame(topbar), side="left")
+    def build_header(self):
+        topbar = put(frame(self), fill="x", padx=18, pady=(16, 6))
+        if LOGO_PATH.exists():
+            self.logo = tk.PhotoImage(file=str(LOGO_PATH))
+            put(tk.Label(topbar, image=self.logo, bg=BG, bd=0), side="right", padx=(0, 2))
+        heading = put(frame(topbar), side="left")
+        wordmark = put(frame(heading), anchor="w")
         for text, kw in (("PHANTOM", {}), (" • ", {"fg": ACCENT}), ("SPLIT", {"muted": True})):
             put(label(wordmark, text, size=13, bold=True, **kw), side="left")
-        dots = put(tk.Canvas(topbar, width=60, height=14, bg=BG, highlightthickness=0), side="right")
-        for i, color in enumerate([ACCENT, DOT_OFF, DOT_OFF]):
-            dots.create_oval(2 + i * 22, 2, 12 + i * 22, 12, fill=color, outline="")
-        put(label(body, f"v{APP_VERSION}  •  {gpu_info()}", muted=True, size=8), anchor="w", padx=22, pady=(0, 6))
+        put(label(heading, f"v{APP_VERSION}  •  {gpu_info()}", muted=True, size=8), anchor="w", padx=(4, 0))
 
-        mode = card(
-            body, "process mode",
-            "mixture files, or a folder of one song's stems to mix down",
-        )
+    def build_mode_and_status(self):
+        top = put(frame(self), fill="x", padx=18, pady=8)
+        halves = []
+        for column, padx in enumerate(((0, 8), (8, 0))):
+            top.columnconfigure(column, weight=1, uniform="top")
+            halves.append(frame(top))
+            halves[-1].grid(row=0, column=column, sticky="nsew", padx=padx)
+        side_by_side = {"fill": "both", "expand": True, "padx": 0, "pady": 0}
+
+        mode = card(halves[0], "process mode", "Mixture files, or one song's stems to mix down", **side_by_side)
         row = put(frame(mode), anchor="w")
         self.mode_buttons = {
-            name: put(button(row, name, lambda n=name: self.set_input_type(n)), side="left", padx=(0, 8))
-            for name in ("mixture", "stems")
+            name: put(button(row, name.capitalize(), lambda n=name: self.set_input_type(n)), side="left", padx=(0, 8))
+            for name in MODES
         }
         self.recursive_check = put(
-            check(mode, "recursive (search subfolders)", v["recursive"]), anchor="w", pady=(10, 0),
+            Toggle(mode, "Recursive (search subfolders)", self.vars["recursive"]), anchor="w", pady=(10, 0),
         )
+
+        status = card(halves[1], "status", "Current batch state", **side_by_side)
+        row = put(frame(status), fill="x")
+        self.status_dot = put(tk.Canvas(row, width=10, height=10, bg=CARD_BG, highlightthickness=0), side="left")
+        self.status_oval = self.status_dot.create_oval(1, 1, 9, 9, outline="")
+        self.status_label = put(
+            label(row, "Ready", muted=True, anchor="w", width=1), side="left", padx=(6, 0), fill="x", expand=True,
+        )
+        self.progress = put(
+            ttk.Progressbar(status, mode="determinate", style="Accent.Horizontal.TProgressbar"),
+            fill="x", pady=(12, 6),
+        )
+        self.progress_label = put(label(status, "", muted=True, anchor="w", width=1), fill="x")
+
+    def build_inference(self):
+        v = self.vars
         inference = card(
-            body, "inference", f"{MODEL_NAME}: more overlap is slower, a bigger batch needs more gpu memory",
+            self, "inference", f"{MODEL_NAME}: more overlap is slower, a bigger batch needs more GPU memory",
         )
         row = put(frame(inference), anchor="w")
-        for key in ("batch_size", "num_overlap"):
-            field(row, key, v[key])
+        for key, text in (("batch_size", "Batch size"), ("num_overlap", "Overlap")):
+            field(row, text, v[key])
+
+        row = put(frame(inference), anchor="w", pady=(10, 0))
+        put(label(row, "Format"), side="left", padx=(0, 6))
+        self.format_buttons = {
+            name: put(button(row, name.upper(), lambda n=name: self.set_format(n), small=True), side="left", padx=(0, 6))
+            for name in QUALITY
+        }
+        self.quality_menu = put(tk.OptionMenu(row, v["bits"], ""), side="left", padx=(8, 4))
+        self.quality_menu.configure(
+            bg=INPUT_BG, fg=FG, activebackground=INPUT_HOVER, activeforeground=FG, relief="flat", bd=0,
+            highlightthickness=0, font=(FONT, 10), width=4, cursor="hand2", indicatoron=False,
+        )
+        self.quality_menu["menu"].configure(
+            bg=INPUT_BG, fg=FG, activebackground=ACCENT, activeforeground=ACCENT_FG, bd=0, font=(FONT, 10), tearoff=0,
+        )
+        self.quality_unit = put(label(row, ""), side="left")
         put(
-            check(inference, "tta (also split the song played backwards and average, 2x processing time)", v["tta"]),
+            Toggle(inference, "TTA (also split the song played backwards and average, 2x processing time)", v["tta"]),
             anchor="w", pady=(10, 0),
         )
 
-        source = card(body, "input", "mixture file/folder, or in stems mode a folder of one song's stems")
-        self.browse_file_btn = path_field(source, v["root"], [
-            ("browse file", lambda: self.browse("root", folder=False)),
-            ("browse folder", lambda: self.browse("root")),
+    def build_paths(self):
+        v = self.vars
+        paths = card(
+            self, "paths",
+            "Input: a file or folder (in stems mode, one song's stems)  •  Output: a folder  •  Drag and drop works",
+        )
+        self.browse_file_btn = path_field(paths, "Input", v["root"], [
+            ("Browse file", lambda: self.browse("root", folder=False)),
+            ("Browse folder", lambda: self.browse("root")),
+        ])[1][0]
+        self.out_entry = path_field(paths, "Output", v["out"], [
+            ("Browse", lambda: self.browse("out")),
+            ("Open folder", lambda: open_folder(v["out"].get())),
         ])[0]
-
-        output = card(body, "output", "where center.flac / wide.flac are written")
-        path_field(output, v["out"], [
-            ("browse", lambda: self.browse("out")),
-            ("open folder", lambda: open_folder(v["out"].get())),
-        ])
-        self.disk_label = put(label(output, "", muted=True, size=8), anchor="w", pady=(10, 0))
+        self.disk_label = put(label(paths, "", muted=True, size=8), anchor="w", pady=(2, 0))
         put(
-            check(
-                output,
-                "flat mode (songname_center.flac / songname_wide.flac all in one folder, no per-song folders)",
-                v["flat"],
+            Toggle(
+                paths, "Flat mode (songname_center / songname_wide all in one folder, no per-song folders)", v["flat"],
             ),
             anchor="w", pady=(6, 0),
         )
 
-        row = put(frame(card(body, "status", "current batch state")), fill="x")
-        self.status_dot = put(tk.Canvas(row, width=10, height=10, bg=CARD_BG, highlightthickness=0), side="left")
-        self.status_oval = self.status_dot.create_oval(1, 1, 9, 9, fill=DOT_OFF, outline="")
-        self.status_label = put(
-            label(row, "ready", muted=True, anchor="w"), side="left", padx=(6, 0), fill="x", expand=True,
-        )
-        self.progress = put(
-            ttk.Progressbar(row, mode="determinate", style="Accent.Horizontal.TProgressbar"),
-            side="left", fill="x", expand=True, padx=12,
-        )
-        self.progress_label = put(label(row, "", muted=True, width=16, anchor="e"), side="left")
-        self.progress_mark = None
+    def enable_drop(self):
+        if TkinterDnD is None:
+            return
+        try:
+            TkinterDnD._require(self)
+        except Exception:
+            return
+        for widget, key in ((self, "root"), (self.out_entry, "out")):
+            widget.drop_target_register(DND_FILES)
+            widget.dnd_bind("<<Drop>>", lambda e, k=key: self.on_drop(k, e.data))
 
-    def build_scroll_area(self):
-        canvas = put(
-            tk.Canvas(put(frame(self), side="top", fill="both", expand=True), bg=BG, highlightthickness=0),
-            side="left", fill="both", expand=True,
-        )
-        scroll_frame = frame(canvas)
-        scroll_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        window_id = canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
-        canvas.bind("<Configure>", lambda e: canvas.itemconfig(window_id, width=e.width))
-        canvas.bind_all("<MouseWheel>", lambda e: canvas.yview_scroll(int(-1 * (e.delta / 120)), "units"))
-        return scroll_frame
-
-    def values(self):
-        return {key: var.get() for key, var in self.vars.items()}
-
-    def set_input_type(self, name):
-        self.vars["input_type"].set(name)
-        for mode, btn in self.mode_buttons.items():
-            bg, fg, active = toggle_colors(mode == name, inactive_fg=FG_MUTED)
-            btn.configure(bg=bg, fg=fg, activebackground=active)
-        state = "disabled" if name == "stems" else "normal"
-        self.browse_file_btn.configure(state=state)
-        self.recursive_check.configure(state=state)
-
-    def set_status(self, running):
-        self.status_dot.itemconfig(self.status_oval, fill=ACCENT if running else DOT_OFF)
-        self.status_label.configure(text="running" if running else "ready")
+    def on_drop(self, key, data):
+        dropped = [Path(item) for item in self.tk.splitlist(data)]
+        if not dropped:
+            return
+        path = dropped[0]
+        if path.is_file() and (key == "out" or len(dropped) > 1 or self.vars["input_type"].get() == "stems"):
+            path = path.parent
+        self.vars[key].set(path.as_posix())
 
     def browse(self, key, folder=True):
         if folder:
@@ -780,13 +676,11 @@ class BatchGUI(tk.Tk):
         if path:
             self.vars[key].set(path)
 
-    def update_disk_label(self):
-        out_str = self.vars["out"].get()
-        free = disk_free_gb(out_str) if out_str and Path(out_str).exists() else None
-        self.disk_label.configure(text=f"free space: {free:.1f} gb" if free is not None else "")
+    def values(self):
+        return {key: var.get() for key, var in self.vars.items()}
 
-    def on_save(self):
-        save_config(self.values())
+    def quality_key(self):
+        return "kbps" if self.vars["format"].get() == "mp3" else "bits"
 
     def inference_settings(self):
         batch_size, num_overlap = int(self.vars["batch_size"].get()), int(self.vars["num_overlap"].get())
@@ -794,35 +688,65 @@ class BatchGUI(tk.Tk):
             raise ValueError
         return batch_size, num_overlap
 
-    def update_status_message(self, msg):
-        print(msg)
-        self.status_label.configure(text=msg)
+    def set_input_type(self, name):
+        self.vars["input_type"].set(name)
+        highlight(self.mode_buttons, name)
+        state = "disabled" if name == "stems" else "normal"
+        self.browse_file_btn.configure(state=state)
+        self.recursive_check.configure(state=state)
+
+    def set_format(self, name):
+        self.vars["format"].set(name)
+        highlight(self.format_buttons, name)
+        key, choices = self.quality_key(), QUALITY[name]
+        var = self.vars[key]
+        if var.get() not in choices:
+            var.set(choices[-1])
+        menu = self.quality_menu["menu"]
+        menu.delete(0, "end")
+        for choice in choices:
+            menu.add_command(label=choice, command=lambda c=choice: var.set(c))
+        self.quality_menu.configure(textvariable=var)
+        self.quality_unit.configure(text=key)
+
+    def set_running(self, running):
+        self.run_btn.configure(state="disabled" if running else "normal")
+        self.stop_btn.configure(state="normal" if running else "disabled")
+        self.status_dot.itemconfig(self.status_oval, fill=ACCENT if running else DOT_OFF)
+        self.progress.configure(value=0)
+        self.progress_label.configure(text="")
+        self.progress_mark = None
+
+    def update_disk_label(self, *_):
+        try:
+            text = f"Free space: {shutil.disk_usage(self.vars['out'].get()).free / 1024 ** 3:.1f} GB"
+        except (OSError, ValueError):
+            text = ""
+        self.disk_label.configure(text=text)
+
+    def show_progress(self, done, total, position=None):
+        now = time.monotonic()
+        if not self.progress_mark or done < self.progress_mark[2]:
+            self.progress_mark = (now, done, done)
+        started, first, _ = self.progress_mark
+        self.progress_mark = (started, first, done)
+        text = "  •  ".join(filter(None, (position, f"{100 * done // total}%")))
+        if first < done < total:
+            text += "  " + format_left(round((now - started) * (total - done) / (done - first)))
+        self.progress.configure(maximum=total, value=done)
+        self.progress_label.configure(text=text)
 
     def poll_log_queue(self):
         try:
             while True:
                 msg = self.log_queue.get_nowait()
-                if isinstance(msg, tuple):
-                    done, total = msg
-                    self.progress.configure(maximum=total, value=done)
-                    now = time.monotonic()
-                    if not self.progress_mark or done < self.progress_mark[2]:
-                        self.progress_mark = (now, done, done)
-                    started, first, _ = self.progress_mark
-                    self.progress_mark = (started, first, done)
-                    text = f"{100 * done // total}%"
-                    if first < done < total:
-                        left = round((now - started) * (total - done) / (done - first))
-                        text += f"  {left // 60}:{left % 60:02d} left"
-                    self.progress_label.configure(text=text)
-                elif msg is None:
-                    self.run_btn.configure(state="normal")
-                    self.progress.configure(value=0)
-                    self.progress_label.configure(text="")
-                    self.progress_mark = None
-                    self.status_dot.itemconfig(self.status_oval, fill=DOT_OFF)
+                if msg is None:
+                    self.set_running(False)
+                elif isinstance(msg, tuple):
+                    self.show_progress(*msg)
                 else:
-                    self.update_status_message(msg)
+                    print(msg)
+                    self.status_label.configure(text=msg)
         except queue.Empty:
             pass
         self.after(100, self.poll_log_queue)
@@ -830,44 +754,50 @@ class BatchGUI(tk.Tk):
     def validate(self):
         v = self.values()
         if not v["root"] or not Path(v["root"]).exists():
-            return "input file or folder does not exist"
+            return "Input file or folder does not exist"
         if v["input_type"] == "stems" and not Path(v["root"]).is_dir():
-            return "stems mode requires a folder of stem files"
+            return "Stems mode requires a folder of stem files"
         if not v["out"]:
-            return "output folder is required"
+            return "Output folder is required"
         try:
             self.inference_settings()
         except ValueError:
-            return "batch_size and num_overlap must be whole numbers, 1 or more"
+            return "Batch size and overlap must be whole numbers, 1 or more"
         return None
+
+    def on_save(self):
+        CONFIG_PATH.write_text(json.dumps(self.values(), indent=2), encoding="utf-8")
+
+    def on_stop(self):
+        STOP.set()
+        self.stop_btn.configure(state="disabled")
+        self.status_label.configure(text="Stopping")
 
     def on_run(self):
         if self.worker and self.worker.is_alive():
             return
-        error = self.validate()
-        if error:
-            messagebox.showerror("phantomsplit", error)
+        if error := self.validate():
+            messagebox.showerror("PhantomSplit", error)
             return
 
         self.on_save()
-        v, settings = self.values(), self.inference_settings()
-        self.run_btn.configure(state="disabled")
-        self.set_status(True)
+        v, settings, quality = self.values(), self.inference_settings(), self.vars[self.quality_key()].get()
+        STOP.clear()
+        self.set_running(True)
+        self.status_label.configure(text="Running")
         emit = self.log_queue.put
-
-        def on_progress(done, total):
-            emit((done, total))
 
         def work():
             try:
-                download_model_files(emit, on_progress)
-                emit(f"loading {MODEL_NAME}")
-                engines = load_engines(*settings, tta=v["tta"])
-                engines[0]["on_progress"] = on_progress
+                download_model_files(emit, lambda done, total: emit((done, total)))
+                emit(f"Loading {MODEL_NAME}")
                 run_batch(
-                    v["root"], v["out"], v["recursive"], engines, emit,
-                    stems_mode=v["input_type"] == "stems", flat=v["flat"],
+                    v["root"], v["out"], load_engine(*settings, v["tta"]), emit,
+                    recursive=v["recursive"], stems_mode=v["input_type"] == "stems", flat=v["flat"],
+                    fmt=v["format"], quality=quality,
                 )
+            except Stopped:
+                emit("Stopped")
             except Exception as e:
                 print(traceback.format_exc())
                 emit(f"[error] {e}")
@@ -879,6 +809,5 @@ class BatchGUI(tk.Tk):
 
 if __name__ == "__main__":
     if os.name == "nt":
-        import ctypes
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_ID)
     BatchGUI().mainloop()
