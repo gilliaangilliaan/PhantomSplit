@@ -1,5 +1,5 @@
 #define AppName "PhantomSplit"
-#define AppVersion "1.0.0"
+#define AppVersion "1.0.1"
 
 [Setup]
 AppId={{6C1B7C52-3B0E-4E0A-9A55-7D4E2F1C9A31}
@@ -10,6 +10,7 @@ UsePreviousAppDir=yes
 DisableDirPage=auto
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
+RedirectionGuard=no
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 OutputDir=Output

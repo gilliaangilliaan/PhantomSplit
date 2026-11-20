@@ -8,6 +8,7 @@ PhantomSplit splits stereo audio into a mono center track and a wide (side) trac
 - **Stems mode:** split every stem in a folder of one song, then mix the results down into one center and one wide file.
 - **Flat mode:** write `songname_center` / `songname_wide` into one folder, with no per-song subfolders.
 - **TTA:** also split the song played backwards and average the two results (about twice the processing time).
+- **Input formats:** WAV, FLAC, MP3, AIFF, OGG, M4A / MP4 / AAC, Opus and WMA. Files that cannot be read are listed in a message at the end of the batch.
 - **Output format:** WAV (16 / 24 / 32-bit float), FLAC (16 / 24-bit) or MP3 (128 to 320 kbps).
 - **Batch size and overlap:** adjustable in the app; the defaults come from the model's config.
 - Drag and drop a file or folder onto the window to set the input, or onto the output bar to set the output folder.
@@ -15,7 +16,7 @@ PhantomSplit splits stereo audio into a mono center track and a wide (side) trac
 
 ## Install
 
-Download [PhantomSplit-1.0.0-Setup.exe](https://github.com/gilliaangilliaan/PhantomSplit/releases/download/1.0.0/PhantomSplit-1.0.0-Setup.exe) from the [1.0.0 release](https://github.com/gilliaangilliaan/PhantomSplit/releases/tag/1.0.0) and run it.
+Download [PhantomSplit-1.0.1-Setup.exe](https://github.com/gilliaangilliaan/PhantomSplit/releases/download/1.0.1/PhantomSplit-1.0.1-Setup.exe) from the [1.0.1 release](https://github.com/gilliaangilliaan/PhantomSplit/releases/tag/1.0.1) and run it.
 
 The installer:
 

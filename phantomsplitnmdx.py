@@ -1,4 +1,5 @@
 import ctypes
+import gc
 import json
 import os
 import queue
@@ -11,6 +12,7 @@ import time
 import traceback
 import urllib.request
 import webbrowser
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from itertools import chain, count
 from math import gcd
@@ -28,11 +30,16 @@ from tqdm.auto import tqdm
 from bs_roformer import BSRoformer
 
 try:
+    import av
+except ImportError:
+    av = None
+
+try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
 except ImportError:
     TkinterDnD = None
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 APP_ID = "gilliaan.phantomsplit"
 APP_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = APP_DIR / "phantomsplit_config.json"
@@ -51,7 +58,7 @@ MODEL_CONFIG = MODELS_DIR / "gilliaan_bsspatialroformer_centerwide_v4.yaml"
 MODEL_CKPT = MODELS_DIR / "gilliaan_bsspatialroformer_centerwide_v4.ckpt"
 
 SAMPLE_RATE = 44100
-AUDIO_EXTS = (".wav", ".flac", ".m4a", ".mp3", ".aiff", ".aif")
+AUDIO_EXTS = (".wav", ".flac", ".mp3", ".aiff", ".aif", ".ogg", ".m4a", ".mp4", ".aac", ".opus", ".wma")
 MODES = ("mixture", "stems")
 QUALITY = {"wav": ("16", "24", "32"), "flac": ("16", "24"), "mp3": ("128", "192", "256", "320")}
 SUBTYPES = {"16": "PCM_16", "24": "PCM_24", "32": "FLOAT"}
@@ -63,6 +70,7 @@ DEFAULT_CONFIG = {
 }
 
 WORKERS = 2
+DOWNLOAD_TRIES = 5
 GPU_LOCK = threading.Lock()
 STOP = threading.Event()
 
@@ -117,22 +125,43 @@ def load_config():
     return cfg
 
 
+def download(url, path, emit, on_progress):
+    part = path.with_name(path.name + ".part")
+    if path.exists():
+        if path.suffix != ".ckpt" or zipfile.is_zipfile(path):
+            return
+        path.replace(part)
+    emit(f"Downloading {path.name}")
+    error = None
+    for _ in range(DOWNLOAD_TRIES):
+        done = part.stat().st_size if part.exists() else 0
+        request = urllib.request.Request(url, headers={"Range": f"bytes={done}-"})
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                resumed = response.status == 206
+                done = done if resumed else 0
+                total = done + int(response.headers.get("Content-Length") or 0)
+                with open(part, "ab" if resumed else "wb") as f:
+                    while chunk := response.read(1 << 20):
+                        check_stop()
+                        f.write(chunk)
+                        done += len(chunk)
+                        if total:
+                            on_progress(done, total)
+            if done == total or not total:
+                part.replace(path)
+                return
+        except OSError as e:
+            error = e
+            if getattr(e, "code", None) == 416:
+                part.unlink(missing_ok=True)
+    raise OSError(f"Download of {path.name} was interrupted ({error or 'connection lost'}), press process to resume")
+
+
 def download_model_files(emit, on_progress):
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
     for path in (MODEL_CONFIG, MODEL_CKPT):
-        if path.exists():
-            continue
-        emit(f"Downloading {path.name}")
-        part = path.with_name(path.name + ".part")
-        with urllib.request.urlopen(f"{MODEL_URL}/{path.name}") as response, open(part, "wb") as f:
-            total, done = int(response.headers.get("Content-Length") or 0), 0
-            while chunk := response.read(1 << 20):
-                check_stop()
-                f.write(chunk)
-                done += len(chunk)
-                if total:
-                    on_progress(done, total)
-        part.replace(path)
+        download(f"{MODEL_URL}/{path.name}", path, emit, on_progress)
 
 
 def load_engine(batch_size, num_overlap, tta):
@@ -147,8 +176,27 @@ def load_engine(batch_size, num_overlap, tta):
     }
 
 
+def release_gpu_memory():
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def decode_with_av(path):
+    with av.open(str(path)) as container:
+        resampler = av.AudioResampler(format="fltp", rate=SAMPLE_RATE)
+        frames = chain(container.decode(audio=0), [None])
+        return np.concatenate([out.to_ndarray() for frame in frames for out in resampler.resample(frame)], axis=1)
+
+
 def load_audio(path):
-    audio, sr = sf.read(str(path), always_2d=True, dtype="float32")
+    try:
+        audio, sr = sf.read(str(path), always_2d=True, dtype="float32")
+    except sf.LibsndfileError:
+        try:
+            return decode_with_av(path)
+        except Exception:
+            raise ValueError("unsupported or damaged audio file") from None
     if sr == SAMPLE_RATE:
         return audio.T
     g = gcd(sr, SAMPLE_RATE)
@@ -316,6 +364,8 @@ def run_batch(root, out, engine, emit, *, recursive, stems_mode, flat, fmt, qual
         with ThreadPoolExecutor(WORKERS) as executor:
             return [sum_mix(tracks) for tracks in zip(*executor.map(split_stem, stems))]
 
+    failures = []
+
     def run_task(source, paths, header):
         if STOP.is_set():
             return
@@ -329,12 +379,16 @@ def run_batch(root, out, engine, emit, *, recursive, stems_mode, flat, fmt, qual
             pass
         except Exception as e:
             emit(f"  [error] Failed on {source.name}: {e}")
+            failures.append(f"{source.name}: {e}")
 
     if len(tasks) > 1:
         emit(f"Processing {len(tasks)} file(s), {WORKERS} at a time")
     with ThreadPoolExecutor(WORKERS) as executor:
         list(executor.map(lambda task: run_task(*task), tasks))
-    emit("Stopped" if STOP.is_set() else "Done")
+    if failures:
+        emit(failures)
+    result = f"Done, {len(failures)} of {len(tasks)} failed" if failures else "Done"
+    emit("Stopped" if STOP.is_set() else result)
 
 
 def gpu_info():
@@ -736,6 +790,11 @@ class BatchGUI(tk.Tk, *((TkinterDnD.DnDWrapper,) if TkinterDnD else ())):
         self.progress.configure(maximum=total, value=done)
         self.progress_label.configure(text=text)
 
+    def show_failures(self, failures):
+        more = f"\n\n...and {len(failures) - 10} more" if len(failures) > 10 else ""
+        text = "These files could not be processed:\n\n" + "\n\n".join(failures[:10]) + more
+        messagebox.showwarning("PhantomSplit", text)
+
     def poll_log_queue(self):
         try:
             while True:
@@ -744,6 +803,8 @@ class BatchGUI(tk.Tk, *((TkinterDnD.DnDWrapper,) if TkinterDnD else ())):
                     self.set_running(False)
                 elif isinstance(msg, tuple):
                     self.show_progress(*msg)
+                elif isinstance(msg, list):
+                    self.show_failures(msg)
                 else:
                     print(msg)
                     self.status_label.configure(text=msg)
@@ -801,6 +862,7 @@ class BatchGUI(tk.Tk, *((TkinterDnD.DnDWrapper,) if TkinterDnD else ())):
             except Exception as e:
                 print(traceback.format_exc())
                 emit(f"[error] {e}")
+            release_gpu_memory()
             emit(None)
 
         self.worker = threading.Thread(target=work, daemon=True)

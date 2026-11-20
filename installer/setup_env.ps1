@@ -47,13 +47,8 @@ try {
     $env:UV_PYTHON_INSTALL_DIR = Join-Path $AppDir "python"
     $env:UV_CACHE_DIR = Join-Path $AppDir ".uv-cache"
 
-    $installedTorch = ""
-    if (Test-Path $python) {
-        $ErrorActionPreference = "Continue"
-        try { $installedTorch = "$(& $python -c 'import torch; print(torch.__version__)' 2>$null)".Trim() } catch { $installedTorch = "" }
-        $ErrorActionPreference = "Stop"
-    }
-    $torchReady = $installedTorch -eq "$($build.Version)+$Torch"
+    $installedTorch = "$($build.Version)+$Torch"
+    $torchReady = (Test-Path $python) -and (Test-Path (Join-Path $venv "Lib\site-packages\torch-$installedTorch.dist-info"))
     $packagesReady = $torchReady -and (Test-Path $marker) -and ((Get-Content $marker -Raw).Trim() -eq $wanted)
 
     if ($packagesReady) {
@@ -86,7 +81,21 @@ try {
     Invoke-Tool $uv @("pip", "install", "--python", $python, "-r", $requirements)
 
     Write-Host "`nchecking the install..."
-    Invoke-Tool $python @("-c", "import torch, soundfile, yaml, scipy, tqdm, einops, rotary_embedding_torch, beartype, tkinter; print('torch', torch.__version__, '| gpu available:', torch.cuda.is_available())")
+    $check = @("-c", "import torch, soundfile, yaml, scipy, tqdm, einops, rotary_embedding_torch, beartype, tkinter; print('torch', torch.__version__, '| gpu available:', torch.cuda.is_available())")
+    & $python @check
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "`nPyTorch could not start, which usually means the Microsoft Visual C++ runtime on this PC is missing or too old" -ForegroundColor Yellow
+        Write-Host "downloading it from Microsoft, Windows will ask for permission to install it..."
+        $redist = Join-Path $tools "vc_redist.x64.exe"
+        Invoke-WebRequest "https://aka.ms/vs/17/release/vc_redist.x64.exe" -OutFile $redist -UseBasicParsing
+        try { $setup = Start-Process $redist -ArgumentList "/install", "/quiet", "/norestart" -Verb RunAs -Wait -PassThru }
+        catch { throw "the Visual C++ runtime was not installed (permission declined). install it from https://aka.ms/vs/17/release/vc_redist.x64.exe then run this installer again" }
+        Remove-Item $redist
+        if ($setup.ExitCode -eq 3010) { throw "the Visual C++ runtime was installed but Windows needs a restart. restart the PC, then run this installer again" }
+        if ($setup.ExitCode -notin 0, 1638) { throw "the Visual C++ runtime installer failed (exit code $($setup.ExitCode)). install it from https://aka.ms/vs/17/release/vc_redist.x64.exe then run this installer again" }
+        Write-Host "`nchecking the install again..."
+        Invoke-Tool $python $check
+    }
 
     Set-Content -Path $marker -Value $wanted -Encoding ascii
     if (Test-Path $env:UV_CACHE_DIR) { Remove-Item -Recurse -Force $env:UV_CACHE_DIR }
@@ -95,7 +104,7 @@ try {
 }
 catch {
     Write-Host "`n[error] $_" -ForegroundColor Red
-    Write-Host "check your internet connection, then run the installer again"
+    Write-Host "if this looks like a download problem, check your internet connection, then run the installer again"
     Read-Host "press Enter to close"
     exit 1
 }

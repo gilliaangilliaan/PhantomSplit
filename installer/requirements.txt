@@ -8,3 +8,4 @@ rotary-embedding-torch==0.3.5
 beartype==0.14.1
 packaging
 tkinterdnd2==0.7.0
+av==17.1.0
